@@ -1,0 +1,188 @@
+diff --git a/nRF5_SDK_16.0.0_98a08e2/examples/common/time_sync.c b/nRF5_SDK_16.0.0_98a08e2/examples/common/time_sync.c
+index b9e5477..2b9bfcd 100644
+--- a/nRF5_SDK_16.0.0_98a08e2/examples/common/time_sync.c
++++ b/nRF5_SDK_16.0.0_98a08e2/examples/common/time_sync.c
+@@ -156,7 +156,7 @@ static nrf_atomic_flag_t m_invalid_tx_timing = false;
+ 
+ static bool m_synchronized = false;
+ 
+-static nrf_atomic_u32_t  m_master_counter = 0;
++static volatile int32_t  m_master_counter_diff = 0;
+ static nrf_atomic_u32_t  m_rcv_count      = 0;
+ 
+ static nrf_atomic_u32_t  mp_curr_adj_pkt;
+@@ -645,7 +645,7 @@ static void sync_timer_start(void)
+     if (m_params.high_freq_timer[0] == NRF_TIMER3 || m_params.high_freq_timer[0] == NRF_TIMER4)
+     {
+         // TIMERS 0,1, and 2 only have 4 compare registers
+-        m_params.high_freq_timer[0]->CC[4]   = TIME_SYNC_TIMER_MAX_VAL / 2; // Only used for debugging purposes such as pin toggling
++        m_params.high_freq_timer[0]->CC[5]   = TIME_SYNC_TIMER_MAX_VAL / 2; // Only used for debugging purposes such as pin toggling
+     }
+ 
+     m_params.high_freq_timer[0]->SHORTS      = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
+@@ -694,10 +694,9 @@ uint32_t ts_set_trigger(uint32_t target_tick, uint32_t ppi_endpoint)
+     m_trigger_evt.params.triggered.used_packet_count = 0;
+ 
+     // TODO: is there a way to check if the target value is plausible?
+-    m_trigger_evt.params.triggered.tick_start = ts_timestamp_get_ticks_u64() / TIME_SYNC_TIMER_MAX_VAL;
++    // m_trigger_evt.params.triggered.tick_start = ts_timestamp_get_ticks_u64() / TIME_SYNC_TIMER_MAX_VAL;
+ 
+-    // set capture to new target: (target - local_counter) + (local_counter - m_master_counter)
+-    m_params.high_freq_timer[1]->CC[4] = target_tick - m_master_counter;
++    m_params.high_freq_timer[1]->CC[4] = target_tick - m_master_counter_diff;
+     m_trigger_evt.params.triggered.tick_target = target_tick;
+     nrf_ppi_channel_enable(m_params.ppi_chns[4]); // activate trigger
+     return NRF_SUCCESS;
+@@ -707,16 +706,17 @@ void SWI3_EGU3_IRQHandler(void)
+ {
+     if (NRF_EGU3->EVENTS_TRIGGERED[0] != 0)
+     {
+-        NRF_EGU3->EVENTS_TRIGGERED[0] = 0;
+ 
+-        nrf_atomic_u32_fetch_store(&m_master_counter, ((sync_pkt_t *) mp_curr_adj_pkt)->counter_val);
+-        m_params.high_freq_timer[1]->CC[4] = m_trigger_evt.params.triggered.tick_target - m_master_counter;	// calculate new capture
++        m_master_counter_diff = ((sync_pkt_t *) mp_curr_adj_pkt)->counter_val - m_params.high_freq_timer[1]->CC[1];
++        m_params.high_freq_timer[1]->CC[4] = m_trigger_evt.params.triggered.tick_target - m_master_counter_diff;	// calculate new capture
+ 
+         m_trigger_evt.params.triggered.used_packet_count++;
+-        m_trigger_evt.params.triggered.last_sync = m_master_counter;
++        m_trigger_evt.params.triggered.last_sync = m_params.high_freq_timer[1]->CC[1] - m_master_counter_diff;
+ 
+         nrf_atomic_flag_clear(&m_timer_update_in_progress);
+ 
++        NRF_EGU3->EVENTS_TRIGGERED[0] = 0;
++
+         if (!m_synchronized)
+         {
+             m_synchronized = true;
+@@ -836,11 +836,6 @@ static inline bool sync_timer_offset_compensate(sync_pkt_t * p_pkt)
+         m_params.high_freq_timer[0]->CC[2] = (TIME_SYNC_TIMER_MAX_VAL - timer_offset);
+     }
+ 
+-    /*
+-     * This is necessary, because the following timer reset will not be counted as step
+-     */
+-    p_pkt->counter_val++;
+-
+     // resetting the timer to the trigger target will skip the trigger -> avoid this
+     if (p_pkt->counter_val == m_trigger_evt.params.triggered.tick_target)
+     {
+@@ -869,7 +864,7 @@ static void ppi_sync_timer_adjust_configure(void)
+     NRF_PPI->CHENCLR        = (1 << chn0);
+     NRF_PPI->CH[chn0].EEP   = (uint32_t) &m_params.high_freq_timer[0]->EVENTS_COMPARE[2];
+     NRF_PPI->CH[chn0].TEP   = (uint32_t) &m_params.high_freq_timer[0]->TASKS_CLEAR;
+-    NRF_PPI->FORK[chn0].TEP = (uint32_t) &m_params.high_freq_timer[1]->TASKS_CLEAR;
++    NRF_PPI->FORK[chn0].TEP = 0;//(uint32_t) &m_params.high_freq_timer[1]->TASKS_CLEAR;
+ 
+     // PPI channel 1: disable PPI channel 0 such that the timer is only reset once, and trigger software interrupt
+     NRF_PPI->CHENCLR        = (1 << chn1);
+@@ -889,7 +884,7 @@ static void ppi_radio_rx_configure(void)
+ 
+     NRF_PPI->CH[chn].EEP   = (uint32_t) &NRF_RADIO->EVENTS_ADDRESS;
+     NRF_PPI->CH[chn].TEP   = (uint32_t) &m_params.high_freq_timer[0]->TASKS_CAPTURE[1];
+-    NRF_PPI->FORK[chn].TEP = 0;
++    NRF_PPI->FORK[chn].TEP = (uint32_t) &m_params.high_freq_timer[1]->TASKS_CAPTURE[1];
+     NRF_PPI->CHENSET       = (1 << chn);
+ }
+ 
+@@ -966,12 +961,11 @@ uint32_t ppi_sync_trigger_configure(uint32_t ppi_endpoint)
+     return nrfx_ppi_channel_fork_assign(m_params.ppi_chns[4], (uint32_t) &m_params.egu->TASKS_TRIGGER[2]);
+ }
+ 
+-static void timers_capture(uint32_t * p_sync_timer_val, uint32_t * p_count_timer_val, uint32_t * p_peer_counter)
++static void timers_capture(uint32_t * p_sync_timer_val, uint32_t * p_count_timer_val, int32_t * p_peer_counter)
+ {
+     static nrf_atomic_flag_t m_timestamp_capture_flag = 0;
+ 
+-    uint32_t peer_counter;
+-    bool     timeslot_active;
++    volatile int32_t peer_counter_diff;
+ 
+     if (nrf_atomic_flag_set_fetch(&m_timestamp_capture_flag) != 0)
+     {
+@@ -981,48 +975,45 @@ static void timers_capture(uint32_t * p_sync_timer_val, uint32_t * p_count_timer
+ 
+     nrf_ppi_channel_t ppi_chn;
+     nrfx_err_t ret = nrfx_ppi_channel_alloc(&ppi_chn);
+-    ASSERT(ret == NRFX_SUCCESS);
++    APP_ERROR_CHECK_BOOL(ret == NRFX_SUCCESS);
+ 
+     ppi_counter_timer_capture_configure(ppi_chn);
+ 
+-    // Use loop in case radio state changes from inactive to active during value copy
+-    // Value copy needs to be atomic to get accurate timestamp
++    NVIC_DisableIRQ(m_params.egu_irq_type);
++
++    bool counter_adjustment_triggered;
++
++    // Loop if adjustment procedure happened close to timer capture
+     do
+     {
+-        if (m_radio_state == RADIO_STATE_IDLE)
+-        {
+-            timeslot_active = false;
+-        }
+-        else
++        counter_adjustment_triggered = m_params.egu->EVENTS_TRIGGERED[0];
++
++        m_params.egu->EVENTS_TRIGGERED[1] = 0;
++        m_params.egu->TASKS_TRIGGER[1] = 1;
++        while (m_params.egu->EVENTS_TRIGGERED[1] == 0)
+         {
+-            timeslot_active =  true;
++            __NOP();
+         }
+ 
+-        if (timeslot_active)
++        if (counter_adjustment_triggered)
+         {
+-            // Do critical section during timeslot
+-            NVIC_DisableIRQ(RADIO_IRQn);
+-            m_params.egu->TASKS_TRIGGER[1] = 1;
+-            (void) m_params.egu->EVENTS_TRIGGERED[1];
+-            peer_counter = m_master_counter;
+-            NVIC_EnableIRQ(RADIO_IRQn);
++            peer_counter_diff = ((sync_pkt_t *) mp_curr_adj_pkt)->counter_val - m_params.high_freq_timer[1]->CC[1];
+         }
+         else
+         {
+-            // Critical section not needed outside of timeslot
+-            m_params.egu->TASKS_TRIGGER[1] = 1;
+-            (void) m_params.egu->EVENTS_TRIGGERED[1];
+-            peer_counter = m_master_counter;
++            peer_counter_diff = m_master_counter_diff;
+         }
++    } while (counter_adjustment_triggered != m_params.egu->EVENTS_TRIGGERED[0] ||
++             m_params.high_freq_timer[0]->CC[3] < 2);
+ 
+-    } while (!timeslot_active && (m_radio_state != RADIO_STATE_IDLE));
++    NVIC_EnableIRQ(m_params.egu_irq_type);
+ 
+     ppi_counter_timer_capture_disable(ppi_chn);
+     nrfx_ppi_channel_free(ppi_chn);
+ 
+     *p_sync_timer_val  = m_params.high_freq_timer[0]->CC[3];
+     *p_count_timer_val = (m_params.high_freq_timer[1]->CC[0]);
+-    *p_peer_counter    = peer_counter;
++    *p_peer_counter    = peer_counter_diff;
+ 
+     nrf_atomic_flag_clear(&m_timestamp_capture_flag);
+ }
+@@ -1217,7 +1208,7 @@ uint32_t ts_timestamp_get_ticks_u32(void)
+ {
+     uint32_t sync_timer_val;
+     uint32_t count_timer_val;
+-    uint32_t peer_count;
++    int32_t peer_count;
+ 
+     timers_capture(&sync_timer_val, &count_timer_val, &peer_count);
+ 
+@@ -1229,7 +1220,7 @@ uint64_t ts_timestamp_get_ticks_u64(void)
+     uint32_t sync_timer_val;
+     uint32_t count_timer_val;
+     uint64_t timestamp;
+-    uint32_t  peer_count;
++    int32_t  peer_count;
+ 
+     timers_capture(&sync_timer_val, &count_timer_val, &peer_count);
+ 
